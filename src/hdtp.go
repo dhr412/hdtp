@@ -3,16 +3,24 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strings"
+	"sync"
 	"time"
 )
 
 const (
+	MulticastPort = 8316
+	ACKPort       = 8319
+
 	TypeData uint8 = 0
 	TypeACK  uint8 = 1
 	TypeNACK uint8 = 2
+	TypeEnd  uint8 = 3
 )
 
 type Packet struct {
@@ -72,25 +80,28 @@ func Sender(multicastAddr, localAddr string, messages []string) {
 	}
 	defer conn.Close()
 
-	listener, err := net.ListenUDP("udp", &net.UDPAddr{Port: 8316})
+	// Listen on separate port for ACKs
+	listener, err := net.ListenUDP("udp", &net.UDPAddr{Port: ACKPort})
 	if err != nil {
 		log.Fatalf("ListenUDP failed: %v", err)
 	}
 	defer listener.Close()
 
 	tb := NewTokenBucket(10, 100*time.Millisecond)
-
 	pending := make(map[uint32]Packet)
-	ackChan := make(chan struct {
-		Seq   uint32
-		IsACK bool
-	})
+	ackChannels := make(map[uint32]chan bool)
+	var ackMutex sync.RWMutex
+	var wg sync.WaitGroup
 
+	// ACK listener goroutine
 	go func() {
 		buf := make([]byte, 5)
 		for {
 			n, _, err := listener.ReadFromUDP(buf)
 			if err != nil {
+				if strings.Contains(err.Error(), "use of closed network connection") {
+					return
+				}
 				log.Printf("ACK/NACK read error: %v", err)
 				continue
 			}
@@ -98,10 +109,15 @@ func Sender(multicastAddr, localAddr string, messages []string) {
 				packetType := buf[0]
 				seqNum := binary.BigEndian.Uint32(buf[1:5])
 				isACK := (packetType == TypeACK)
-				ackChan <- struct {
-					Seq   uint32
-					IsACK bool
-				}{Seq: seqNum, IsACK: isACK}
+
+				ackMutex.RLock()
+				if ch, exists := ackChannels[seqNum]; exists {
+					select {
+					case ch <- isACK:
+					default:
+					}
+				}
+				ackMutex.RUnlock()
 			}
 		}
 	}()
@@ -130,38 +146,66 @@ func Sender(multicastAddr, localAddr string, messages []string) {
 			}
 			pending[seqNum] = packet
 
-			go func(seq uint32, buf []byte) {
-				for {
+			// Create dedicated channel for this sequence number
+			ackCh := make(chan bool, 1)
+			ackMutex.Lock()
+			ackChannels[seqNum] = ackCh
+			ackMutex.Unlock()
+
+			wg.Add(1)
+			go func(seq uint32, buf []byte, ackCh chan bool) {
+				defer wg.Done()
+				defer func() {
+					ackMutex.Lock()
+					delete(ackChannels, seq)
+					ackMutex.Unlock()
+					close(ackCh)
+				}()
+
+				maxRetries := 5
+				retries := 0
+				for retries < maxRetries {
 					timeout := time.NewTimer(1 * time.Second)
 					select {
-					case ack := <-ackChan:
-						if ack.Seq == seq {
-							if ack.IsACK {
-								delete(pending, seq)
-								return
-							} else {
-								_, err := conn.Write(buf)
-								if err != nil {
-									log.Printf("Retransmit failed: %v", err)
-								}
+					case isACK := <-ackCh:
+						timeout.Stop()
+						if isACK {
+							delete(pending, seq)
+							return
+						} else {
+							_, err := conn.Write(buf)
+							if err != nil {
+								log.Printf("Retransmit failed for seq %d: %v", seq, err)
 							}
+							retries++
 						}
 					case <-timeout.C:
 						if _, ok := pending[seq]; ok {
 							_, err := conn.Write(buf)
 							if err != nil {
-								log.Printf("Retransmit failed: %v", err)
+								log.Printf("Retransmit failed for seq %d: %v", seq, err)
 							}
+							retries++
 						} else {
 							return
 						}
 					}
-					timeout.Stop()
 				}
-			}(seqNum, buf)
-
+				log.Printf("Max retries reached for seq %d, giving up", seq)
+				delete(pending, seq)
+			}(seqNum, buf, ackCh)
 			seqNum++
 		}
+	}
+
+	wg.Wait()
+
+	endBuf := make([]byte, 5)
+	endBuf[0] = TypeEnd
+	binary.BigEndian.PutUint32(endBuf[1:5], seqNum)
+	_, err = conn.Write(endBuf)
+	if err != nil {
+		log.Printf("End packet write failed: %v", err)
 	}
 }
 
@@ -192,6 +236,10 @@ func Receiver(multicastAddr, localAddr string) {
 		}
 
 		packetType := buf[0]
+		if packetType == TypeEnd {
+			log.Println("Received end-of-transmission packet, exiting")
+			return
+		}
 		if packetType != TypeData {
 			continue
 		}
@@ -207,7 +255,11 @@ func Receiver(multicastAddr, localAddr string) {
 		calcChecksum := sha256.Sum256(payload)
 		checksumMatch := calcChecksum == checksum
 
-		respConn, err := net.DialUDP("udp", nil, srcAddr)
+		ackAddr := &net.UDPAddr{
+			IP:   srcAddr.IP,
+			Port: ACKPort,
+		}
+		respConn, err := net.DialUDP("udp", nil, ackAddr)
 		if err != nil {
 			log.Printf("Dial for response failed: %v", err)
 			continue
@@ -260,9 +312,25 @@ func splitMessage(msg string, size int) []string {
 }
 
 func main() {
-	multicastAddr := "239.255.0.1:8316"
-	localAddr := "0.0.0.0:8316"
+	mode := flag.String("mode", "", "Mode: 'sender' or 'receiver'")
+	message := flag.String("message", "Hello,World,This is a test message", "Comma-separated messages to send (sender mode only)")
+	flag.Parse()
 
-	go Sender(multicastAddr, localAddr, []string{"Hello, multicast!", "Second message", "Third message"})
-	Receiver(multicastAddr, localAddr)
+	multicastAddr := fmt.Sprintf("239.255.0.1:%d", MulticastPort)
+	localAddr := fmt.Sprintf("0.0.0.0:%d", MulticastPort)
+
+	switch *mode {
+	case "sender":
+		messages := strings.Split(*message, ",")
+		log.Printf("Starting sender with %d messages", len(messages))
+		Sender(multicastAddr, localAddr, messages)
+	case "receiver":
+		log.Println("Starting receiver")
+		Receiver(multicastAddr, localAddr)
+	default:
+		fmt.Println("Usage:")
+		fmt.Printf("  Sender: %s --mode sender --message \"Hello,World,Test\"\n", os.Args[0])
+		fmt.Printf("  Receiver: %s --mode receiver\n", os.Args[0])
+		os.Exit(1)
+	}
 }
