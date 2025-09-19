@@ -1,4 +1,4 @@
-module hybrid-data-transfer-protoc
+module hdtp
 
 go 1.24.4
 
