@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -68,7 +71,7 @@ func min(a, b int) int {
 	return b
 }
 
-func Sender(multicastAddr, localAddr string, messages []string) {
+func Sender(multicastAddr, localAddr string, messages []string, isIPv6 bool) {
 	addr, err := net.ResolveUDPAddr("udp", multicastAddr)
 	if err != nil {
 		log.Fatalf("ResolveUDPAddr failed: %v", err)
@@ -80,8 +83,11 @@ func Sender(multicastAddr, localAddr string, messages []string) {
 	}
 	defer conn.Close()
 
-	// Listen on separate port for ACKs
-	listener, err := net.ListenUDP("udp", &net.UDPAddr{Port: ACKPort})
+	laddr := &net.UDPAddr{Port: ACKPort}
+	if isIPv6 {
+		laddr.IP = net.IPv6zero
+	}
+	listener, err := net.ListenUDP("udp", laddr)
 	if err != nil {
 		log.Fatalf("ListenUDP failed: %v", err)
 	}
@@ -209,16 +215,39 @@ func Sender(multicastAddr, localAddr string, messages []string) {
 	}
 }
 
-func Receiver(multicastAddr, localAddr string) {
+func Receiver(multicastAddr, localAddr string, isIPv6 bool) {
 	addr, err := net.ResolveUDPAddr("udp", multicastAddr)
 	if err != nil {
 		log.Fatalf("ResolveUDPAddr failed: %v", err)
 	}
-	conn, err := net.ListenMulticastUDP("udp", nil, addr)
+
+	laddr := &net.UDPAddr{Port: MulticastPort}
+	if isIPv6 {
+		laddr.IP = net.IPv6zero
+	} else {
+		laddr.IP = net.IPv4zero
+	}
+	conn, err := net.ListenUDP("udp", laddr)
 	if err != nil {
-		log.Fatalf("ListenMulticastUDP failed: %v", err)
+		log.Fatalf("ListenUDP failed: %v", err)
 	}
 	defer conn.Close()
+
+	var pc interface {
+		JoinGroup(ifi *net.Interface, group net.Addr) error
+		SetMulticastLoopback(bool) error
+	}
+	if isIPv6 {
+		pc = ipv6.NewPacketConn(conn)
+	} else {
+		pc = ipv4.NewPacketConn(conn)
+	}
+	if err := pc.JoinGroup(nil, addr); err != nil {
+		log.Fatalf("JoinGroup failed: %v", err)
+	}
+	if err := pc.SetMulticastLoopback(true); err != nil {
+		log.Fatalf("SetMulticastLoopback failed: %v", err)
+	}
 
 	received := make(map[uint32][]byte)
 	expectedSeq := uint32(0)
@@ -314,19 +343,26 @@ func splitMessage(msg string, size int) []string {
 func main() {
 	mode := flag.String("mode", "", "Mode: 'sender' or 'receiver'")
 	message := flag.String("message", "Hello,World,This is a test message", "Comma-separated messages to send (sender mode only)")
+	useIPv6 := flag.Bool("ipv6", false, "Use IPv6 multicast")
 	flag.Parse()
 
-	multicastAddr := fmt.Sprintf("239.255.0.1:%d", MulticastPort)
-	localAddr := fmt.Sprintf("0.0.0.0:%d", MulticastPort)
+	var multicastAddr, localAddr string
+	if *useIPv6 {
+		multicastAddr = fmt.Sprintf("[ff02::1]:%d", MulticastPort)
+		localAddr = fmt.Sprintf("[::]:%d", MulticastPort)
+	} else {
+		multicastAddr = fmt.Sprintf("239.255.0.1:%d", MulticastPort)
+		localAddr = fmt.Sprintf("0.0.0.0:%d", MulticastPort)
+	}
 
 	switch *mode {
 	case "sender":
 		messages := strings.Split(*message, ",")
 		log.Printf("Starting sender with %d messages", len(messages))
-		Sender(multicastAddr, localAddr, messages)
+		Sender(multicastAddr, localAddr, messages, *useIPv6)
 	case "receiver":
 		log.Println("Starting receiver")
-		Receiver(multicastAddr, localAddr)
+		Receiver(multicastAddr, localAddr, *useIPv6)
 	default:
 		fmt.Println("Usage:")
 		fmt.Printf("  Sender: %s --mode sender --message \"Hello,World,Test\"\n", os.Args[0])
