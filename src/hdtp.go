@@ -1,10 +1,13 @@
 package main
 
 import (
-	"crypto/sha256"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -26,11 +29,13 @@ const (
 	TypeEnd  uint8 = 3
 )
 
+var encryptionKey []byte
+
 type Packet struct {
-	Type     uint8
-	SeqNum   uint32
-	Payload  []byte
-	Checksum [32]byte
+	Type    uint8
+	SeqNum  uint32
+	Payload []byte
+	Nonce   [12]byte
 }
 
 type TokenBucket struct {
@@ -136,23 +141,36 @@ func Sender(multicastAddr, localAddr string, messages []string, isIPv6 bool) {
 			}
 
 			payload := []byte(chunk)
-			checksum := sha256.Sum256(payload)
-			packet := Packet{Type: TypeData, SeqNum: seqNum, Payload: payload, Checksum: checksum}
 
-			buf := make([]byte, 1+4+32+len(payload))
+			block, err := aes.NewCipher(encryptionKey)
+			if err != nil {
+				log.Fatalf("AES cipher creation failed: %v", err)
+			}
+			gcm, err := cipher.NewGCM(block)
+			if err != nil {
+				log.Fatalf("GCM creation failed: %v", err)
+			}
+			nonce := make([]byte, gcm.NonceSize())
+			if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+				log.Fatalf("Nonce generation failed: %v", err)
+			}
+			encrypted := gcm.Seal(nil, nonce, payload, nil) // ciphertext + tag
+
+			packet := Packet{Type: TypeData, SeqNum: seqNum, Nonce: [12]byte(nonce), Payload: encrypted}
+
+			buf := make([]byte, 1+4+12+len(encrypted))
 			buf[0] = packet.Type
 			binary.BigEndian.PutUint32(buf[1:5], packet.SeqNum)
-			copy(buf[5:37], packet.Checksum[:])
-			copy(buf[37:], packet.Payload)
+			copy(buf[5:17], packet.Nonce[:])
+			copy(buf[17:], packet.Payload)
 
-			_, err := conn.Write(buf)
+			_, err = conn.Write(buf)
 			if err != nil {
 				log.Printf("Write failed: %v", err)
 				continue
 			}
 			pending[seqNum] = packet
 
-			// Create dedicated channel for this sequence number
 			ackCh := make(chan bool, 1)
 			ackMutex.Lock()
 			ackChannels[seqNum] = ackCh
@@ -274,16 +292,23 @@ func Receiver(multicastAddr, localAddr string, isIPv6 bool) {
 		}
 
 		seqNum := binary.BigEndian.Uint32(buf[1:5])
-		if n < 37 {
+		if n < 17 {
 			continue
 		}
-		checksum := [32]byte{}
-		copy(checksum[:], buf[5:37])
-		payload := buf[37:n]
+		nonce := [12]byte{}
+		copy(nonce[:], buf[5:17])
+		encrypted := buf[17:n]
 
-		calcChecksum := sha256.Sum256(payload)
-		checksumMatch := calcChecksum == checksum
-
+		block, err := aes.NewCipher(encryptionKey)
+		if err != nil {
+			log.Fatalf("AES cipher creation failed: %v", err)
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			log.Fatalf("GCM creation failed: %v", err)
+		}
+		payload, err := gcm.Open(nil, nonce[:], encrypted, nil)
+		checksumMatch := (err == nil)
 		ackAddr := &net.UDPAddr{
 			IP:   srcAddr.IP,
 			Port: ACKPort,
@@ -305,7 +330,7 @@ func Receiver(multicastAddr, localAddr string, isIPv6 bool) {
 			}
 			respConn.Close()
 
-			received[seqNum] = payload
+			received[seqNum] = payload // Use decrypted payload
 
 			for {
 				if payload, ok := received[expectedSeq]; ok {
@@ -317,7 +342,7 @@ func Receiver(multicastAddr, localAddr string, isIPv6 bool) {
 				}
 			}
 		} else {
-			log.Printf("Checksum mismatch for seq %d", seqNum)
+			log.Printf("Decryption/verification failed for seq %d: %v", seqNum, err)
 			respBuf[0] = TypeNACK
 			_, err = respConn.Write(respBuf)
 			if err != nil {
@@ -344,7 +369,17 @@ func main() {
 	mode := flag.String("mode", "", "Mode: 'sender' or 'receiver'")
 	message := flag.String("message", "Hello,World,This is a test message", "Comma-separated messages to send (sender mode only)")
 	useIPv6 := flag.Bool("ipv6", false, "Use IPv6 multicast")
+	encKey := flag.String("key", "", "Optional 32-byte AES-256 key (defaults to built-in)")
 	flag.Parse()
+
+	if *encKey != "" {
+		if len(*encKey) != 32 {
+			log.Fatalf("Invalid key length: must be exactly 32 bytes for AES-256")
+		}
+		encryptionKey = []byte(*encKey)
+	} else {
+		encryptionKey = []byte("32-byte-key-for-AES-256-for-tls!")
+	}
 
 	var multicastAddr, localAddr string
 	if *useIPv6 {
