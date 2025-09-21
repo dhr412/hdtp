@@ -364,8 +364,8 @@ func splitMessage(msg string, size int) []string {
 }
 
 func main() {
-	mode := flag.String("mode", "", "Mode: 'sender' or 'receiver'")
-	message := flag.String("message", "Hello,World,This is a test message", "Comma-separated messages to send (sender mode only)")
+	mode := flag.String("mode", "", "Mode: 'sender (s)' or 'receiver (r)'")
+	message := flag.String("msg", "Hello,World,This is a test message", "Comma-separated messages to send (sender mode only)")
 	useIPv6 := flag.Bool("ipv6", false, "Use IPv6 multicast")
 	encKey := flag.String("key", "", "Optional 32-byte AES-256 key (defaults to built-in)")
 	flag.Parse()
@@ -390,11 +390,11 @@ func main() {
 	}
 
 	switch *mode {
-	case "sender":
+	case "sender", "s":
 		messages := strings.Split(*message, ",")
 		log.Printf("Starting sender with %d messages", len(messages))
 		Sender(multicastAddr, localAddr, messages, encryptionKey, *useIPv6)
-	case "receiver":
+	case "receiver", "r":
 		log.Println("Starting receiver")
 		Receiver(multicastAddr, localAddr, encryptionKey, *useIPv6)
 	default:
