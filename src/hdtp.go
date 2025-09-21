@@ -29,8 +29,6 @@ const (
 	TypeEnd  uint8 = 3
 )
 
-var encryptionKey []byte
-
 type Packet struct {
 	Type    uint8
 	SeqNum  uint32
@@ -76,7 +74,7 @@ func min(a, b int) int {
 	return b
 }
 
-func Sender(multicastAddr, localAddr string, messages []string, isIPv6 bool) {
+func Sender(multicastAddr, localAddr string, messages []string, encryptionKey []byte, isIPv6 bool) {
 	addr, err := net.ResolveUDPAddr("udp", multicastAddr)
 	if err != nil {
 		log.Fatalf("ResolveUDPAddr failed: %v", err)
@@ -233,7 +231,7 @@ func Sender(multicastAddr, localAddr string, messages []string, isIPv6 bool) {
 	}
 }
 
-func Receiver(multicastAddr, localAddr string, isIPv6 bool) {
+func Receiver(multicastAddr, localAddr string, encryptionKey []byte, isIPv6 bool) {
 	addr, err := net.ResolveUDPAddr("udp", multicastAddr)
 	if err != nil {
 		log.Fatalf("ResolveUDPAddr failed: %v", err)
@@ -372,6 +370,7 @@ func main() {
 	encKey := flag.String("key", "", "Optional 32-byte AES-256 key (defaults to built-in)")
 	flag.Parse()
 
+	var encryptionKey []byte
 	if *encKey != "" {
 		if len(*encKey) != 32 {
 			log.Fatalf("Invalid key length: must be exactly 32 bytes for AES-256")
@@ -394,10 +393,10 @@ func main() {
 	case "sender":
 		messages := strings.Split(*message, ",")
 		log.Printf("Starting sender with %d messages", len(messages))
-		Sender(multicastAddr, localAddr, messages, *useIPv6)
+		Sender(multicastAddr, localAddr, messages, encryptionKey, *useIPv6)
 	case "receiver":
 		log.Println("Starting receiver")
-		Receiver(multicastAddr, localAddr, *useIPv6)
+		Receiver(multicastAddr, localAddr, encryptionKey, *useIPv6)
 	default:
 		fmt.Println("Usage:")
 		fmt.Printf("  Sender: %s --mode sender --message \"Hello,World,Test\"\n", os.Args[0])
