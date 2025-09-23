@@ -376,7 +376,7 @@ func splitMessage(msg string, size int) []string {
 func main() {
 	mode := flag.String("mode", "", "Mode: 'sender (s)' or 'receiver (r)'")
 	multicast := flag.Bool("multicast", false, "Enable multicast mode (default: unicast)")
-	target := flag.String("target", "127.0.0.1:8316", "Target address:port for unicast mode")
+	target := flag.String("target", fmt.Sprintf("127.0.0.1:%d", CastPort), "Target address:port for unicast mode")
 	message := flag.String("msg", "Hello,World,This is a test message", "Comma-separated messages to send (sender mode only)")
 	useIPv6 := flag.Bool("ipv6", false, "Use IPv6")
 	encKey := flag.String("key", "", "Optional 32-byte AES-256 key (defaults to built-in)")
