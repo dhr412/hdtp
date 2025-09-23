@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	MulticastPort = 8316
-	ACKPort       = 8319
+	CastPort = 8316
+	ACKPort  = 8319
 
 	TypeData uint8 = 0
 	TypeACK  uint8 = 1
@@ -76,8 +76,8 @@ func min(a, b int) int {
 	return b
 }
 
-func Sender(multicastAddr, localAddr string, messages []string, encryptionKey []byte, isIPv6 bool) {
-	addr, err := net.ResolveUDPAddr("udp", multicastAddr)
+func Sender(castAddr, localAddr string, messages []string, encryptionKey []byte, isIPv6 bool) {
+	addr, err := net.ResolveUDPAddr("udp", castAddr)
 	if err != nil {
 		log.Fatalf("ResolveUDPAddr failed: %v", err)
 	}
@@ -239,13 +239,13 @@ func Sender(multicastAddr, localAddr string, messages []string, encryptionKey []
 	}
 }
 
-func Receiver(multicastAddr, localAddr string, encryptionKey []byte, isIPv6 bool) {
-	addr, err := net.ResolveUDPAddr("udp", multicastAddr)
+func Receiver(castAddr, localAddr string, encryptionKey []byte, isIPv6 bool, multicast bool) {
+	addr, err := net.ResolveUDPAddr("udp", castAddr)
 	if err != nil {
 		log.Fatalf("ResolveUDPAddr failed: %v", err)
 	}
 
-	laddr := &net.UDPAddr{Port: MulticastPort}
+	laddr := &net.UDPAddr{Port: CastPort}
 	if isIPv6 {
 		laddr.IP = net.IPv6zero
 	} else {
@@ -257,20 +257,22 @@ func Receiver(multicastAddr, localAddr string, encryptionKey []byte, isIPv6 bool
 	}
 	defer conn.Close()
 
-	var pc interface {
-		JoinGroup(ifi *net.Interface, group net.Addr) error
-		SetMulticastLoopback(bool) error
-	}
-	if isIPv6 {
-		pc = ipv6.NewPacketConn(conn)
-	} else {
-		pc = ipv4.NewPacketConn(conn)
-	}
-	if err := pc.JoinGroup(nil, addr); err != nil {
-		log.Fatalf("JoinGroup failed: %v", err)
-	}
-	if err := pc.SetMulticastLoopback(true); err != nil {
-		log.Fatalf("SetMulticastLoopback failed: %v", err)
+	if multicast {
+		var pc interface {
+			JoinGroup(ifi *net.Interface, group net.Addr) error
+			SetMulticastLoopback(bool) error
+		}
+		if isIPv6 {
+			pc = ipv6.NewPacketConn(conn)
+		} else {
+			pc = ipv4.NewPacketConn(conn)
+		}
+		if err := pc.JoinGroup(nil, addr); err != nil {
+			log.Fatalf("JoinGroup failed: %v", err)
+		}
+		if err := pc.SetMulticastLoopback(true); err != nil {
+			log.Fatalf("SetMulticastLoopback failed: %v", err)
+		}
 	}
 
 	received := make(map[uint32][]byte)
@@ -373,8 +375,10 @@ func splitMessage(msg string, size int) []string {
 
 func main() {
 	mode := flag.String("mode", "", "Mode: 'sender (s)' or 'receiver (r)'")
+	multicast := flag.Bool("multicast", false, "Enable multicast mode (default: unicast)")
+	target := flag.String("target", "127.0.0.1:8316", "Target address:port for unicast mode")
 	message := flag.String("msg", "Hello,World,This is a test message", "Comma-separated messages to send (sender mode only)")
-	useIPv6 := flag.Bool("ipv6", false, "Use IPv6 multicast")
+	useIPv6 := flag.Bool("ipv6", false, "Use IPv6")
 	encKey := flag.String("key", "", "Optional 32-byte AES-256 key (defaults to built-in)")
 	flag.Parse()
 
@@ -388,27 +392,33 @@ func main() {
 		encryptionKey = []byte("32-byte-key-for-AES-256-for-tls!")
 	}
 
-	var multicastAddr, localAddr string
+	var castAddr, localAddr string
 	if *useIPv6 {
-		multicastAddr = fmt.Sprintf("[ff02::1]:%d", MulticastPort)
-		localAddr = fmt.Sprintf("[::]:%d", MulticastPort)
+		localAddr = fmt.Sprintf("[::]:%d", CastPort)
+		if *multicast {
+			castAddr = fmt.Sprintf("[ff02::1]:%d", CastPort)
+		} else {
+			castAddr = *target
+		}
 	} else {
-		multicastAddr = fmt.Sprintf("239.255.0.1:%d", MulticastPort)
-		localAddr = fmt.Sprintf("0.0.0.0:%d", MulticastPort)
+		localAddr = fmt.Sprintf("0.0.0.0:%d", CastPort)
+		if *multicast {
+			castAddr = fmt.Sprintf("239.255.0.1:%d", CastPort)
+		} else {
+			castAddr = *target
+		}
 	}
 
 	switch *mode {
 	case "sender", "s":
 		messages := strings.Split(*message, ",")
 		log.Printf("Starting sender with %d messages", len(messages))
-		Sender(multicastAddr, localAddr, messages, encryptionKey, *useIPv6)
+		Sender(castAddr, localAddr, messages, encryptionKey, *useIPv6)
 	case "receiver", "r":
 		log.Println("Starting receiver")
-		Receiver(multicastAddr, localAddr, encryptionKey, *useIPv6)
+		Receiver(castAddr, localAddr, encryptionKey, *useIPv6, *multicast)
 	default:
-		fmt.Println("Usage:")
-		fmt.Printf("  Sender: %s --mode sender --message \"Hello,World,Test\"\n", os.Args[0])
-		fmt.Printf("  Receiver: %s --mode receiver\n", os.Args[0])
+		flag.Usage()
 		os.Exit(1)
 	}
 }
