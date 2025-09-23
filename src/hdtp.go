@@ -36,6 +36,8 @@ type Packet struct {
 	Nonce   [12]byte
 }
 
+var srtt time.Duration = 200 * time.Millisecond
+
 type TokenBucket struct {
 	tokens     int
 	capacity   int
@@ -96,6 +98,7 @@ func Sender(multicastAddr, localAddr string, messages []string, encryptionKey []
 	}
 	defer listener.Close()
 
+	sendTimes := make(map[uint32]time.Time)
 	tb := NewTokenBucket(10, 100*time.Millisecond)
 	pending := make(map[uint32]Packet)
 	ackChannels := make(map[uint32]chan bool)
@@ -162,6 +165,7 @@ func Sender(multicastAddr, localAddr string, messages []string, encryptionKey []
 			copy(buf[5:17], packet.Nonce[:])
 			copy(buf[17:], packet.Payload)
 
+			sendTimes[seqNum] = time.Now()
 			_, err = conn.Write(buf)
 			if err != nil {
 				log.Printf("Write failed: %v", err)
@@ -192,6 +196,10 @@ func Sender(multicastAddr, localAddr string, messages []string, encryptionKey []
 					case isACK := <-ackCh:
 						timeout.Stop()
 						if isACK {
+							rtt := time.Since(sendTimes[seq])
+							srtt = (7*srtt + rtt) / 8
+							tb.rate = time.Duration(0.5*float64(srtt.Milliseconds())+50) * time.Millisecond
+							delete(sendTimes, seq)
 							delete(pending, seq)
 							return
 						} else {
