@@ -9,7 +9,7 @@ HDTP is an experimental protocol implemented in Go, leveraging UDP to provide:
 - **Guaranteed Delivery**: Ensures all packets reach recipients via ACK/NACK-based retransmissions.
 - **Ordered Delivery**: Uses sequence numbers for in-order packet processing.
 - **Error Detection and Encryption**: Employs AES-256-GCM for encryption and integrity verification, with retransmissions on decryption failures.
-- **Multicast Support**: Enables one-to-many communication using UDP multicast.
+- **Multicast Support**: Enables one-to-many communication using UDP multicast when the `--multicast` flag is set.
 - **Throughput Control**: Limits sending rate with a token bucket (10 packets/second, adaptive based on smoothed RTT).
 - **Stateless Design**: Maintains no persistent connection state, with self-contained packets.
 
@@ -22,7 +22,7 @@ TCP offers reliability but incurs high latency due to connection setup and conge
 ## How It Works
 
 - **Sender**: Splits messages into chunks (≤1000 bytes), assigns sequence numbers, and encrypts payloads using AES-256-GCM with a 32-byte key. Packets are sent to a multicast or unicast UDP address, with a token bucket limiting throughput. The sender listens for ACK/NACK responses on port 8319 and retransmits (up to 5 retries) on timeouts (1-second) or NACKs. An end packet signals transmission completion.
-- **Receiver**: Joins a multicast group or listens on a unicast address (port 8316), decrypts and verifies packets using AES-256-GCM, and sends ACKs for valid packets or NACKs for corrupted ones. It buffers packets and delivers them in order based on sequence numbers, printing received messages.
+- **Receiver**: Joins a multicast group (if `--multicast` is set) or listens on a unicast address (port 8316), decrypts and verifies packets using AES-256-GCM, and sends ACKs for valid packets or NACKs for corrupted ones. It buffers packets and delivers them in order based on sequence numbers, printing received messages.
 - **Adaptive Rate Control**: The sender adjusts the token bucket rate based on smoothed round-trip time (SRTT), starting at 200ms and updated as (7*SRTT + RTT)/8.
 
 ## Usage
@@ -36,18 +36,26 @@ Download the precompiled binary for your platform from the [Releases](https://gi
 To send messages, run:
 
 ```bash
-./hdtp --mode sender --msg "msg1,msg2,msg3" [--ipv6] [--key "32-byte-key-for-AES-256-for-tls!"]
+./hdtp --mode sender [--multicast] [--target "address:port"] --msg "msg1,msg2,msg3" [--ipv6] [--key "32-byte-key-for-AES-256-for-tls!"]
 ```
 
 - `--mode sender` or `-mode s`: Sets sender mode.
+- `--multicast`: Enables multicast mode (default: unicast).
+- `--target`: Target address:port for unicast mode (default: `127.0.0.1:8316`).
 - `--msg`: Comma-separated messages to send (default: "Hello,World,This is a test message").
 - `--ipv6`: Enables IPv6 multicast (default: IPv4).
 - `--key`: Optional 32-byte AES-256 key (default: built-in key).
 
-Example:
+Example (unicast):
 
 ```bash
-./hdtp -mode s -msg "Hello,World,Test"
+./hdtp -mode s -msg "Hello,World,Test" -target "127.0.0.1:8316"
+```
+
+Example (multicast):
+
+```bash
+./hdtp -mode s -msg "Hello,World,Test" --multicast
 ```
 
 #### Receiver
@@ -55,17 +63,25 @@ Example:
 To receive messages, run:
 
 ```bash
-./hdtp --mode receiver [--ipv6] [--key "32-byte-key-for-AES-256-for-tls!"]
+./hdtp --mode receiver [--multicast] [--target "address:port"] [--ipv6] [--key "32-byte-key-for-AES-256-for-tls!"]
 ```
 
 - `--mode receiver` or `-mode r`: Sets receiver mode.
+- `--multicast`: Enables multicast mode (default: unicast).
+- `--target`: Target address:port for unicast mode (default: `127.0.0.1:8316`).
 - `--ipv6`: Enables IPv6 multicast (default: IPv4).
 - `--key`: Optional 32-byte AES-256 key (must match sender's key).
 
-Example:
+Example (unicast):
 
 ```bash
-./hdtp -mode r
+./hdtp -mode r -target "127.0.0.1:8316"
+```
+
+Example (multicast):
+
+```bash
+./hdtp -mode r --multicast
 ```
 
 ### Running from Source Code
@@ -77,18 +93,26 @@ Ensure Go 1.20 or later is installed and network access is available for UDP mul
 To send messages, compile and run:
 
 ```bash
-go run hdtp.go --mode sender --msg "msg1,msg2,msg3" [--ipv6] [--key "32-byte-key-for-AES-256-for-tls!"]
+go run hdtp.go --mode sender [--multicast] [--target "address:port"] --msg "msg1,msg2,msg3" [--ipv6] [--key "32-byte-key-for-AES-256-for-tls!"]
 ```
 
 - `--mode sender` or `-mode s`: Sets sender mode.
+- `--multicast`: Enables multicast mode (default: unicast).
+- `--target`: Target address:port for unicast mode (default: `127.0.0.1:8316`).
 - `--msg`: Comma-separated messages to send (default: "Hello,World,This is a test message").
 - `--ipv6`: Enables IPv6 multicast (default: IPv4).
 - `--key`: Optional 32-byte AES-256 key (default: built-in key).
 
-Example:
+Example (unicast):
 
 ```bash
-go run hdtp.go -mode s -msg "Hello,World,Test"
+go run hdtp.go -mode s -msg "Hello,World,Test" -target "127.0.0.1:8316"
+```
+
+Example (multicast):
+
+```bash
+go run hdtp.go -mode s -msg "Hello,World,Test" --multicast
 ```
 
 #### Receiver
@@ -96,22 +120,31 @@ go run hdtp.go -mode s -msg "Hello,World,Test"
 To receive messages, compile and run:
 
 ```bash
-go run hdtp.go --mode receiver [--ipv6] [--key "32-byte-key-for-AES-256-for-tls!"]
+go run hdtp.go --mode receiver [--multicast] [--target "address:port"] [--ipv6] [--key "32-byte-key-for-AES-256-for-tls!"]
 ```
 
 - `--mode receiver` or `-mode r`: Sets receiver mode.
+- `--multicast`: Enables multicast mode (default: unicast).
+- `--target`: Target address:port for unicast mode (default: `127.0.0.1:8316`).
 - `--ipv6`: Enables IPv6 multicast (default: IPv4).
 - `--key`: Optional 32-byte AES-256 key (must match sender's key).
 
-Example:
+Example (unicast):
 
 ```bash
-go run hdtp.go -mode r
+go run hdtp.go -mode r -target "127.0.0.1:8316"
+```
+
+Example (multicast):
+
+```bash
+go run hdtp.go -mode r --multicast
 ```
 
 ### Notes
 
-- Ensure the sender and receiver use the same encryption key and IP version.
+- Ensure the sender and receiver use the same encryption key, IP version, and multicast setting.
+- For multicast, use `--multicast` on both sender and receiver; for unicast, specify `--target` or use the default.
 - Run the receiver before the sender to avoid missing packets.
 - The program exits after receiving an end-of-transmission packet (receiver) or sending all messages (sender).
 
