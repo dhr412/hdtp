@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"os"
 	"strings"
@@ -23,17 +24,23 @@ const (
 	CastPort = 8316
 	ACKPort  = 8319
 
-	TypeData uint8 = 0
-	TypeACK  uint8 = 1
-	TypeNACK uint8 = 2
-	TypeEnd  uint8 = 3
+	TypeData  uint8 = 0
+	TypeACK   uint8 = 1
+	TypeNACK  uint8 = 2
+	TypeEnd   uint8 = 3
+	TypeClose uint8 = 4
+
+	DefaultWindow uint32 = 128
 )
 
 type Packet struct {
-	Type    uint8
-	SeqNum  uint32
-	Payload []byte
-	Nonce   [12]byte
+	Type      uint8
+	SeqNum    uint32
+	Window    uint32
+	SACKStart uint32
+	SACKEnd   uint32
+	Payload   []byte
+	Nonce     [12]byte
 }
 
 var srtt time.Duration = 200 * time.Millisecond
@@ -100,14 +107,14 @@ func Sender(castAddr, localAddr string, messages []string, encryptionKey []byte,
 
 	sendTimes := make(map[uint32]time.Time)
 	tb := NewTokenBucket(10, 100*time.Millisecond)
+	recvWindow := DefaultWindow
 	pending := make(map[uint32]Packet)
 	ackChannels := make(map[uint32]chan bool)
 	var ackMutex sync.RWMutex
 	var wg sync.WaitGroup
 
-	// ACK listener goroutine
 	go func() {
-		buf := make([]byte, 5)
+		buf := make([]byte, 17)
 		for {
 			n, _, err := listener.ReadFromUDP(buf)
 			if err != nil {
@@ -117,13 +124,23 @@ func Sender(castAddr, localAddr string, messages []string, encryptionKey []byte,
 				log.Printf("ACK/NACK read error: %v", err)
 				continue
 			}
-			if n == 5 {
+			if n == 17 {
 				packetType := buf[0]
 				seqNum := binary.BigEndian.Uint32(buf[1:5])
+				window := binary.BigEndian.Uint32(buf[5:9])
+				sackStart := binary.BigEndian.Uint32(buf[9:13])
+				sackEnd := binary.BigEndian.Uint32(buf[13:17])
 				isACK := (packetType == TypeACK)
 
 				ackMutex.RLock()
 				if ch, exists := ackChannels[seqNum]; exists {
+					pending[seqNum] = Packet{
+						Type:      packetType,
+						SeqNum:    seqNum,
+						Window:    window,
+						SACKStart: sackStart,
+						SACKEnd:   sackEnd,
+					}
 					select {
 					case ch <- isACK:
 					default:
@@ -137,6 +154,11 @@ func Sender(castAddr, localAddr string, messages []string, encryptionKey []byte,
 	seqNum := uint32(0)
 	for _, msg := range messages {
 		for _, chunk := range splitMessage(msg, 1000) {
+			if len(pending) >= int(recvWindow) {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
 			for !tb.Take() {
 				time.Sleep(10 * time.Millisecond)
 			}
@@ -200,7 +222,16 @@ func Sender(castAddr, localAddr string, messages []string, encryptionKey []byte,
 							srtt = (7*srtt + rtt) / 8
 							tb.rate = time.Duration(0.5*float64(srtt.Milliseconds())+50) * time.Millisecond
 							delete(sendTimes, seq)
-							delete(pending, seq)
+							if packet, ok := pending[seq]; ok {
+								recvWindow = packet.Window
+								if packet.SACKStart != 0 && packet.SACKEnd != 0 {
+									for s := packet.SACKStart; s <= packet.SACKEnd; s++ {
+										delete(pending, s)
+									}
+								} else {
+									delete(pending, seq)
+								}
+							}
 							return
 						} else {
 							_, err := conn.Write(buf)
@@ -237,6 +268,14 @@ func Sender(castAddr, localAddr string, messages []string, encryptionKey []byte,
 	if err != nil {
 		log.Printf("End packet write failed: %v", err)
 	}
+
+	closeBuf := make([]byte, 1)
+	closeBuf[0] = TypeClose
+	_, err = conn.Write(closeBuf)
+	if err != nil {
+		log.Printf("Close packet failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
 }
 
 func Receiver(castAddr, localAddr string, encryptionKey []byte, isIPv6 bool, multicast bool) {
@@ -277,6 +316,7 @@ func Receiver(castAddr, localAddr string, encryptionKey []byte, isIPv6 bool, mul
 
 	received := make(map[uint32][]byte)
 	expectedSeq := uint32(0)
+	recvBufferSize := DefaultWindow
 
 	for {
 		buf := make([]byte, 65535)
@@ -286,16 +326,25 @@ func Receiver(castAddr, localAddr string, encryptionKey []byte, isIPv6 bool, mul
 			continue
 		}
 
-		if n < 5 {
+		if n < 1 {
 			continue
 		}
 
 		packetType := buf[0]
 		if packetType == TypeEnd {
-			log.Println("Received end-of-transmission packet, exiting")
+			log.Println("Received end-of-transmission packet, resetting for new transfer")
+			received = make(map[uint32][]byte)
+			expectedSeq = 0
+			continue
+		}
+		if packetType == TypeClose {
+			log.Println("Received close packet, shutting down")
 			return
 		}
 		if packetType != TypeData {
+			continue
+		}
+		if packetType == TypeData && n < 17 {
 			continue
 		}
 
@@ -326,9 +375,26 @@ func Receiver(castAddr, localAddr string, encryptionKey []byte, isIPv6 bool, mul
 			log.Printf("Dial for response failed: %v", err)
 			continue
 		}
+		currentWindow := recvBufferSize - uint32(len(received))
 
-		respBuf := make([]byte, 5)
+		respBuf := make([]byte, 17)
 		binary.BigEndian.PutUint32(respBuf[1:5], seqNum)
+		binary.BigEndian.PutUint32(respBuf[5:9], currentWindow)
+
+		if len(received) > 0 {
+			minSeq := uint32(math.MaxUint32)
+			maxSeq := uint32(0)
+			for s := range received {
+				if s < minSeq {
+					minSeq = s
+				}
+				if s > maxSeq {
+					maxSeq = s
+				}
+			}
+			binary.BigEndian.PutUint32(respBuf[9:13], minSeq)
+			binary.BigEndian.PutUint32(respBuf[13:17], maxSeq)
+		}
 
 		if checksumMatch {
 			respBuf[0] = TypeACK
@@ -338,7 +404,17 @@ func Receiver(castAddr, localAddr string, encryptionKey []byte, isIPv6 bool, mul
 			}
 			respConn.Close()
 
-			received[seqNum] = payload // Use decrypted payload
+			if len(received) >= int(recvBufferSize) {
+				log.Printf("Buffer full, dropping seq %d", seqNum)
+				respBuf[0] = TypeNACK
+				_, err = respConn.Write(respBuf)
+				if err != nil {
+					log.Printf("NACK write failed: %v", err)
+				}
+				respConn.Close()
+				continue
+			}
+			received[seqNum] = payload
 
 			for {
 				if payload, ok := received[expectedSeq]; ok {
